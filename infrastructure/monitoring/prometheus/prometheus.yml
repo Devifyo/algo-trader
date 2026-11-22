@@ -1,0 +1,39 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+  external_labels:
+    cluster: algo-trader
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: trading-engine
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["trading-engine:9100"]
+        labels: { service: trading-engine }
+
+  - job_name: ai-engine
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["ai-engine:8000"]
+        labels: { service: ai-engine }
+
+  - job_name: news-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["news-service:8000"]
+        labels: { service: news-service }
+
+  - job_name: portfolio-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["portfolio-service:8000"]
+        labels: { service: portfolio-service }
+
+  # node/cadvisor exporters can be added here in production for host metrics.

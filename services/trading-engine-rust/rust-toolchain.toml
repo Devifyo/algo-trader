@@ -1,0 +1,5 @@
+[toolchain]
+# Track latest stable. Several transitive deps (time, home, uuid) raise their
+# MSRV frequently and require a recent rustc (>= 1.88).
+channel = "stable"
+components = ["rustfmt", "clippy"]

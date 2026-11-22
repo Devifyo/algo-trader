@@ -1,0 +1,10 @@
+httpx==0.28.1
+feedparser==6.0.11        # RSS/Atom news feeds
+redis==5.2.1              # collection queue + sentiment snapshot
+asyncpg==0.30.0           # durable news storage
+nats-py==2.9.0            # publish advisory sentiment
+prometheus-client==0.21.1
+scrapling==0.4.9         # broad/anti-bot news collection (regulator press pages)
+curl_cffi>=0.7,<1.0      # scrapling's HTTP fetcher backend
+playwright>=1.49,<2.0    # imported eagerly by scrapling (module only; no browser binaries used)
+browserforge             # scrapling fingerprint/header generator (eager import)

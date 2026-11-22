@@ -1,0 +1,24 @@
+[package]
+name = "market-data"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "market_data"
+path = "src/lib.rs"
+
+[[bin]]
+name = "market-data"
+path = "src/main.rs"
+
+[dependencies]
+tcore = { path = "../core", package = "core" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+futures.workspace = true
+rand.workspace = true
+tokio-tungstenite.workspace = true

@@ -1,0 +1,34 @@
+# secrets & env
+.env
+*.env.local
+vault/data/
+vault/file/
+*.key
+*.pem
+
+# rust
+services/trading-engine-rust/target/
+**/*.rs.bk
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+services/ai-engine-python/.venv/
+
+# laravel
+dashboard/laravel/vendor/
+dashboard/laravel/node_modules/
+dashboard/laravel/.env
+dashboard/laravel/storage/*.key
+dashboard/laravel/public/build/
+
+# data volumes (if bind-mounted)
+data/
+infrastructure/monitoring/grafana/data/
+
+# os / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

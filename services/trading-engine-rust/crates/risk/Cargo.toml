@@ -1,0 +1,24 @@
+[package]
+name = "risk"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "risk"
+path = "src/lib.rs"
+
+[[bin]]
+name = "risk"
+path = "src/main.rs"
+
+[dependencies]
+tcore = { path = "../core", package = "core" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+futures.workspace = true
+uuid.workspace = true
+sqlx.workspace = true

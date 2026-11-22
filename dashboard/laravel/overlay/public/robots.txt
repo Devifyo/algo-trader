@@ -1,0 +1,18 @@
+User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /dashboard
+Disallow: /bots
+Disallow: /portfolio
+Disallow: /markets
+Disallow: /logs
+Disallow: /news
+Disallow: /ai-decisions
+Disallow: /brokers
+Disallow: /exchange-keys
+Disallow: /notifications
+Disallow: /onboarding
+Disallow: /marketplace
+Disallow: /copy-trading
+
+Sitemap: https://tradepilot.devifyo.cloud/sitemap.xml

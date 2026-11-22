@@ -1,0 +1,57 @@
+groups:
+  - name: latency
+    rules:
+      - alert: MarketDataLatencyHigh
+        expr: histogram_quantile(0.99, sum(rate(market_data_latency_seconds_bucket[5m])) by (le)) > 0.010
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Market-data p99 latency > 10ms"
+      - alert: OrderSubmissionLatencyHigh
+        expr: histogram_quantile(0.99, sum(rate(order_submission_latency_seconds_bucket[5m])) by (le)) > 0.050
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Order submission p99 latency > 50ms"
+
+  - name: trading
+    rules:
+      - alert: KillSwitchEngaged
+        expr: kill_switch_engaged == 1
+        for: 0m
+        labels: { severity: critical }
+        annotations:
+          summary: "KILL SWITCH ENGAGED — trading halted"
+      - alert: DailyDrawdownBreached
+        expr: daily_drawdown_pct >= scalar(risk_daily_drawdown_limit_pct)
+        for: 0m
+        labels: { severity: critical }
+        annotations:
+          summary: "Daily drawdown limit breached"
+      - alert: OrderRejectRateHigh
+        expr: sum(rate(orders_rejected_total[5m])) by (exchange) > 0.5
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "High order reject rate on {{ $labels.exchange }}"
+      - alert: ExchangeReconnectStorm
+        expr: sum(rate(ws_reconnects_total[5m])) by (exchange) > 0.2
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "WebSocket reconnect storm on {{ $labels.exchange }}"
+
+  - name: availability
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.job }} is down"
+      - alert: StalePriceFeed
+        expr: time() - market_data_last_tick_timestamp_seconds > 30
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Stale price feed for {{ $labels.symbol }}"

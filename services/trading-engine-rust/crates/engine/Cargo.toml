@@ -1,0 +1,21 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "engine"
+path = "src/main.rs"
+
+[dependencies]
+tcore = { path = "../core", package = "core" }
+market-data = { path = "../market-data" }
+signals = { path = "../signals" }
+risk = { path = "../risk" }
+execution = { path = "../execution" }
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+# Process-wide TLS crypto provider for the Binance wss:// feed (rustls 0.23
+# requires one explicitly when more than one backend is in the dep tree).
+rustls = "0.23"

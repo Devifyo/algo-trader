@@ -1,0 +1,48 @@
+{
+  "title": "algo-trader — Overview",
+  "uid": "algo-overview",
+  "schemaVersion": 39,
+  "tags": ["algo-trader"],
+  "timezone": "utc",
+  "refresh": "10s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "type": "stat", "title": "Kill switch",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "targets": [{ "expr": "kill_switch_engaged" }],
+      "fieldConfig": { "defaults": { "mappings": [
+        { "type": "value", "options": { "0": { "text": "OFF", "color": "green" }, "1": { "text": "ENGAGED", "color": "red" } } }
+      ] } }
+    },
+    {
+      "type": "stat", "title": "Open positions",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "targets": [{ "expr": "sum(open_positions)" }]
+    },
+    {
+      "type": "timeseries", "title": "Realized PnL",
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 0 },
+      "targets": [{ "expr": "sum(realized_pnl_usd)" }]
+    },
+    {
+      "type": "timeseries", "title": "Latency p99 (ms)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "1000*histogram_quantile(0.99, sum(rate(market_data_latency_seconds_bucket[5m])) by (le))", "legendFormat": "market-data" },
+        { "expr": "1000*histogram_quantile(0.99, sum(rate(signal_latency_seconds_bucket[5m])) by (le))", "legendFormat": "signal" },
+        { "expr": "1000*histogram_quantile(0.99, sum(rate(risk_latency_seconds_bucket[5m])) by (le))", "legendFormat": "risk" },
+        { "expr": "1000*histogram_quantile(0.99, sum(rate(order_submission_latency_seconds_bucket[5m])) by (le))", "legendFormat": "order" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Orders & rejects /s",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "sum(rate(orders_submitted_total[1m]))", "legendFormat": "submitted" },
+        { "expr": "sum(rate(orders_filled_total[1m]))", "legendFormat": "filled" },
+        { "expr": "sum(rate(orders_rejected_total[1m]))", "legendFormat": "rejected" }
+      ]
+    }
+  ]
+}

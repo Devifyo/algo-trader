@@ -1,0 +1,362 @@
+# Launch-Readiness Audit (20-agent) — 174 findings
+
+
+## CRITICAL
+
+- **tenant.rs** — Documented Postgres RLS tenant isolation is not implemented anywhere
+  - Fix: Either implement the defense-in-depth that the comment promises or delete the false comment so no one trusts it. Recommended: add a Store::with_tenant(tenant) that checks out a connection, runs `SELECT set_config('app.tenant_id', $1, true)`
+- **config.rs** — Hard-coded dev Vault token and DB/Redis passwords as silent env defaults
+  - Fix: Make secret config fail-closed: in from_env(), if trading_mode == Live (and ideally always in non-synthetic mode) and VAULT_TOKEN/DATABASE_URL/REDIS_URL are unset, return an error / panic at boot instead of substituting a default. At minimu
+- **lib.rs** — Strategies loaded once at startup — new/edited/disabled bots never take effect without restart
+  - Fix: Subscribe to control.strategy (or poll enabled_strategy_profiles on an interval / LISTEN-NOTIFY) and rebuild the by_tenant map live. At minimum, wrap the strategy set in an Arc<RwLock<...>> updated by a background task that reloads on CONTR
+- **lib.rs** — Position-count and drawdown gates are TOCTOU-racy: approved orders are never persisted in the risk path
+  - Fix: Reserve exposure synchronously at approval time. Either (a) INSERT the order/position row inside evaluate() before publishing (so open_position_count counts pending intents), or (b) maintain an authoritative in-Redis per-tenant open/pending
+- **store.rs** — Duplicate fills and double-counted position/PnL on NATS redelivery (no fill idempotency)
+  - Fix: Make execution idempotent on client_id end-to-end: have insert_order detect whether the row already existed (e.g. RETURNING id, (xmax = 0) AS inserted) and short-circuit handle() when not newly inserted, OR add a UNIQUE constraint on fills(
+- **lib.rs** — Execution does not honor kill-switch or per-tenant halt — emergency stop is not respected for queued/in-flight orders
+  - Fix: At the top of handle(), after decoding, check ctx.store.kill_switch() and ctx.store.tenant_halted(order.tenant); if either is engaged, record the order as Canceled/Rejected with reason KILL_SWITCH/TENANT_HALTED and publish EXEC_REJECT inste
+- **store.rs** — RLS provides no tenant-isolation backstop for the engine — it connects as the privileged owner role
+  - Fix: Either run the engine under the non-owner algotrader_app role and add FORCE ROW LEVEL SECURITY plus a per-operation SET LOCAL app.tenant_id inside a transaction (implement the documented store::with_tenant(tenant, |tx| ...) helper), or, if 
+- **router.py** — New HTTP/SDK client created per request — no connection pooling at 50 users
+  - Fix: Build providers once and cache them keyed by (provider_name, key_id) in the router (or hold a long-lived module-level httpx.AsyncClient with httpx.Limits and an anthropic.AsyncAnthropic per key). Reuse across requests; close on shutdown. Do
+- **router.py** — Daily budget never resets and is per-process only — no real spend ceiling
+  - Fix: Persist and read spend from Postgres (you already have ai_requests and ai_cost_tracking with window_start). In _key_available, compute today's spend via SELECT COALESCE(SUM(cost_usd),0) FROM ai_requests WHERE key_id=$1 AND time >= date_trun
+- **router.py** — monthly_limit_usd is loaded but never enforced
+  - Fix: Add a monthly spend check in _key_available analogous to the daily one, backed by a DB SUM over the current calendar month (or ai_cost_tracking with period='monthly'). Do not rely on in-memory state for the monthly window.
+- **router.py** — Circuit-breaker and failure state are wiped by refresh(), re-closing open circuits
+  - Fix: Make circuit state authoritative in the DB: load circuit_open_until in load_providers and have _key_available honor key.status=='circuit_open' and circuit_open_until > now(). Don't reset consecutive_failures purely from a refresh. Decouple 
+- **risk_manager.py** — Risk manager recommends adding risk to a fully/over-exposed portfolio (headroom=0 falls through to full leverage)
+  - Fix: Remove the `or p.max_leverage` fallback. Compute headroom-scaled leverage directly and clamp size to zero when headroom is zero: e.g. `max_notional = equity * min(p.max_leverage, headroom_pct/100.0*p.max_leverage)`; and change the exposure 
+- **main.py** — No authentication / tenant isolation / rate limiting on any endpoint
+  - Fix: Either (preferred) confirm and document that the API gateway terminates auth + injects/validates a verified tenant context and that this port is bound to the internal network only; or add a shared-secret/JWT dependency (`Depends(verify_toke
+- **ExchangeKeyController.php** — ExchangeKeyController writes/reads every tenant's keys under the hardcoded default tenant (cross-tenant leak)
+  - Fix: Replace config('app.default_tenant') with $request->user()->tenant_id in both the insert and the vault_path, exactly as BrokerController::connect does. Consider deleting this legacy controller entirely since BrokerController supersedes it (
+- **SetTenantContext.php** — Tenant GUC set with session scope on a shared connection — leaks across tenants under any pooling
+  - Fix: Bind tenant context to a transaction with transaction-local scope: wrap each request's DB work in a transaction and use set_config('app.tenant_id', ?, true) (true = local), or run SET LOCAL inside the transaction. At minimum, explicitly RES
+- **07_auth.sql** — users table is not under RLS but is fully writable by the restricted app role
+  - Fix: Put users under RLS with a policy allowing a session to see only its own tenant's users (id = current_tenant_id() style on tenant_id), and handle pre-auth login lookups via the owner pgsql_admin connection only (login by email already happe
+- **web.php** — No rate limiting on login/register (and all POST actions) — brute force and signup abuse open
+  - Fix: Add Laravel's throttle middleware: ->middleware('throttle:6,1') on POST /login and POST /register (or a named limiter keyed by email+IP), and a global throttle on the auth group. Re-enable Fortify-style login throttling. Also bind the dashb
+- **docker-compose.yml** — Committed default secrets and Vault running in -dev mode
+  - Fix: Before launch: rotate the algotrader_app password and inject via secret, not a literal in init SQL; run Vault in production (server with a real backend, sealed, AppRole/token with a scoped policy, no dev root token); remove all dev-only-roo
+- **AppLayout.vue** — Kill switch uses uninitialized window.__killOn — safety control state is wrong on load
+  - Fix: Seed and bind real state from server props (e.g. page.props.app.killSwitch). Compute `const on = !page.props.app.killSwitch` and toggle confirm wording based on the actual current value (only confirm when engaging). Style the button to refl
+- **03_multitenancy.sql** — RLS enabled but not FORCEd; app role is granted owner-level table access and will bypass tenant isolation
+  - Fix: Add `ALTER TABLE %I FORCE ROW LEVEL SECURITY;` inside the same FOREACH loop (03_multitenancy.sql lines 80-92) for every tenant-scoped table and for tenants itself, so even the owner is subject to RLS, then explicitly exempt only the trusted
+- **03_multitenancy.sql** — Tenant context uses session-scoped SET app.tenant_id, which leaks across pooled connections at 50 users
+  - Fix: Use transaction-scoped settings: `SET LOCAL app.tenant_id = '<uuid>'` (or SELECT set_config('app.tenant_id', $1, true)) inside the per-request transaction, and ensure RLS-protected queries always run in a transaction. If PgBouncer is in tra
+- **03_multitenancy.sql** — Restricted app role ships with a hard-coded default password committed to the repo
+  - Fix: Do not set a literal password in SQL. Inject it from a Docker secret / env var at init time (e.g. via a psql \set from POSTGRES_APP_PASSWORD), fail the init if the variable is unset, and ensure the role is unusable until a real secret is pr
+- **03_multitenancy.sql** — exchange_keys and bots are not RLS-protected; tenant-facing controllers have no tenant_id filter -> cross-tenant read/write
+  - Fix: Add 'exchange_keys' and 'bots' (plus any other tenant_id table queried by tenant routes: portfolios, ai_requests, ai_consensus_results) to the RLS array in 03_multitenancy.sql so ENABLE ROW LEVEL SECURITY + tenant_isolation policy apply. As
+- **KillSwitchController.php** — Emergency kill-switch write swallows failures and reports success
+  - Fix: Do not use rescue() for the actual kill-switch write. Perform the Redis SET, verify with a read-back, and only on confirmed success return the 'halted' message; on any failure surface a loud error to the operator and page/alert. Audit only 
+- **SetTenantContext.php** — RLS tenant context uses session scope on reused connections — cross-tenant leak
+  - Fix: Set the GUC transactionally and reset it: wrap each request's DB work so you run set_config('app.tenant_id', ?, true) (true = local to transaction) inside a transaction, OR explicitly RESET app.tenant_id in a terminating middleware / on eve
+- **03_multitenancy.sql** — RLS not FORCED; default-tenant fallback can mask missing context
+  - Fix: Add `ALTER TABLE %I FORCE ROW LEVEL SECURITY` in the loop for all tenant tables. Make current_tenant_id() RAISE if the GUC is unset for app-role sessions (fail closed) instead of returning NULL. Remove the silent default-tenant fallback in 
+
+## HIGH
+
+- **store.rs** — insert_order ON CONFLICT is a no-op that returns wrong order id on duplicate client_id
+  - Fix: Verify client_id is globally unique and tenant-scoped before relying on this. Better: make the upsert assert identity (e.g. `ON CONFLICT (client_id) DO UPDATE SET status=orders.status WHERE orders.tenant_id = EXCLUDED.tenant_id`) and have t
+- **compliance.rs** — Compliance rate-limiter and PDT guard are per-process, non-shared, unbounded in-memory state
+  - Fix: Back the rate-limit and PDT windows with Redis (sliding-window counters / sorted sets keyed by tenant) so limits are correct across replicas and survive restarts — this also bounds memory. If kept in-memory for paper mode, document the sing
+- **store.rs** — Postgres pool of 10 connections likely undersized and identical across all services
+  - Fix: Make pool size configurable via env, set acquire_timeout (e.g. 5s) so exhaustion surfaces as an error not a hang, set max_lifetime/idle_timeout to recycle connections, and size the aggregate (pool x services x replicas) against Postgres max
+- **binance.rs** — Binance WS has no keepalive / read timeout — half-open connection stalls forever (24x7 resilience)
+  - Fix: Wrap the read in `tokio::time::timeout(Duration::from_secs(~20), ws.next())` and break to reconnect on elapsed; explicitly reply to `Message::Ping(p)` with `ws.send(Message::Pong(p))` (currently Ping is ignored at line 69); and proactively 
+- **lib.rs** — emit_candle swallows DB persistence failures; handle() warns-and-continues — silent data loss with no alert
+  - Fix: Increment a dedicated failure counter metric (e.g. metrics::inc("candle_persist_failures_total")) on the insert error path so the existing Prometheus alert rules can fire, and consider a bounded retry/dead-letter for closed candles rather t
+- **store.rs** — enabled_strategy_profiles loads all regions/tenants with no region filter or RLS
+  - Fix: Add a region column filter to the query (… AND region = $1, bind config.region.as_str()) and actually implement the documented RLS path (acquire a connection, SET LOCAL app.tenant_id / app.region, run query) rather than fetch_all on the bar
+- **lib.rs** — Entire order path is a single strictly-sequential consumer; no concurrency at 50 tenants
+  - Fix: Either spawn a bounded worker pool (e.g. buffer_unordered over the stream) keeping the limiter/pdt behind the existing Mutexes (which now become genuinely needed), or shard consumers per region/tenant-group. At minimum, collapse the per-sig
+- **lib.rs** — Fail-open defaults on data-dependent gates allow orders when state stores are unreachable
+  - Fix: Make safety-critical reads fail closed: on Err from tenant_halted, equity_usd, or realized_pnl_today, reject the signal (return Err("STATE_UNAVAILABLE")) rather than substituting an optimistic value. Only treat genuinely-absent (Ok(None)) v
+- **lib.rs** — Risk consumer exits silently and is never restarted if the NATS subscription ends
+  - Fix: Wrap the subscribe+consume loop in a reconnect loop that re-subscribes with backoff and never returns Ok on stream-end; emit a metric/alert on resubscribe. Alternatively have the supervisor restart any exited service task with backoff inste
+- **lib.rs** — PDT and order-rate compliance budgets are consumed on orders that are then rejected by sizing
+  - Fix: Move limiter.allow and pdt.record to after successful sizing, right before constructing the OrderIntent (or only record on successful publish). Persist PDT day-trade history in Redis/PG keyed by tenant with the rolling window so it survives
+- **lib.rs** — Single-threaded sequential execution loop head-of-line-blocks all tenants
+  - Fix: Process orders concurrently with bounded parallelism, e.g. a tokio task pool / buffer_unordered over the subscriber stream (cap concurrency to ~pool max_connections), or shard by tenant. Ensure the DB pool size (currently 10) is raised in s
+- **store.rs** — Postgres pool of 10 connections shared across four services in one process
+  - Fix: Make max_connections configurable from env and size it for the deployment (e.g. 20-40 for the single-VPS engine), set acquire_timeout and a sane min_connections, and ensure it stays below Postgres max_connections accounting for the Laravel 
+- **config.rs** — Live Vault token is static and long-lived, sourced from env with an insecure default
+  - Fix: Before live: use a Vault AppRole/Kubernetes auth flow with token renewal (or a sidecar agent), reuse a single reqwest::Client, enforce HTTPS to Vault, and fail loudly at boot if VAULT_TOKEN is the dev default while TRADING_MODE=live. The co
+- **router.py** — Consensus misaligns verdicts with provider weights (candidate recomputed in zip)
+  - Fix: Compute the candidate list once: `pairs = [(p, c) for p in self._providers if (c := self._first_candidate_for(p, tier))]`, await gather over `[self._one_call(c, ...) for _, c in pairs]`, then zip results against `pairs` so weight/provider a
+- **config_store.py** — Vault secret resolved on every call; no caching, token renewal, or failure alarm
+  - Fix: Cache resolved secrets in-process with a TTL (and/or fetch at startup/refresh), use a Vault auth method with lease renewal, and raise a distinct retryable=False error type for 'secret backend down' so it can be alarmed separately from model
+- **router.py** — Budget/spend tracked globally per key with no per-tenant isolation
+  - Fix: Track and enforce spend per (tenant_id, key_id) — or per tenant against a tenant-level budget — and include tenant_id in the budget check in _key_available. Reconcile against DB aggregates rather than relying solely on in-process counters.
+- **router.py** — In-memory spend/circuit counters are process-local and not authoritative across replicas
+  - Fix: Make spend and circuit state authoritative in Postgres/Redis (the DB already has circuit_open_until and consecutive_failures), and add an explicit daily-rollover for spend. Treat in-memory values as a cache validated against the store.
+- **config_store.py** — asyncpg pool max_size=5 is undersized for 50 users + per-call multiple acquisitions
+  - Fix: Raise max_size to a value sized for fan-out x concurrency (e.g. 20-30) and set min_size higher (e.g. 5). Add command_timeout / a pool acquire timeout so a saturated pool fails fast and degrades to neutral rather than hanging. Consider batch
+- **router.py** — refresh() races with in-flight calls; consensus zip can misalign verdict weights
+  - Fix: Snapshot the candidate list once: build a list of (provider_cfg, candidate) tuples, launch tasks from it, and zip results against that same list instead of recomputing _first_candidate_for. Guard self._providers swaps with an asyncio.Lock o
+- **router.py** — Per-call provider/client construction defeats connection reuse and SDK pooling
+  - Fix: Cache provider instances keyed by (provider_name, key_id) and reuse them. Cache resolved secrets with a TTL instead of calling Vault per request. Reuse a single httpx.AsyncClient (or the SDK's client) across calls rather than per-request co
+- **analyzer.py** — Queue items are deleted before processing — articles are permanently lost on any worker error or restart
+  - Fix: Make processing at-least-once: either (a) use a Redis reliable-queue pattern (BRPOPLPUSH into a per-worker processing list, then LREM on success, with a reaper that re-queues stale processing entries), or (b) re-enqueue the article_id in th
+- **main.py** — Unbounded request inputs allow a single user to pin all workers (DoS at 50 concurrent users)
+  - Fix: Add pydantic bounds: max lengths on closes/candidates/bots/space (e.g. Field(max_length=...)), cap optimizer space dimensions and max_evals, cap returns-series length. Increase worker/threadpool capacity appropriately for 50 users and/or mo
+- **portfolio.py** — Guaranteed 500 (unhandled KeyError) when a bot position omits 'symbol'
+  - Fix: Use `p.get("symbol")` and skip/aggregate positions with no symbol (e.g. `sym = p.get("symbol"); if not sym: continue`). Better: define a Pydantic model for bot/position so malformed input returns a 422 with a clear field error instead of a 
+- **OnboardingController.php** — OnboardingController records progress under the default tenant for all tenants
+  - Fix: Use $request->user()->tenant_id instead of config('app.default_tenant') in the updateOrInsert key.
+- **AdminController.php** — Connection-pool exhaustion at 50 concurrent users: Apache prefork opens one Postgres connection per request, no pooler, two connections per admin request
+  - Fix: Add PgBouncer (transaction pooling) in front of Postgres for the hub, OR cap Apache workers (MpmPreforkModule MaxRequestWorkers) to a safe number below Postgres max_connections minus engine reservations, and raise Postgres max_connections d
+- **entrypoint.sh** — Config is not cached; every request re-parses all config files (per-request cost at 50 users)
+  - Fix: Bake runtime values into config() and run `php artisan config:cache` in entrypoint, then read everything via config() (env() returns null once config is cached, so the env() calls in HandleInertiaRequests/BrokerController/AiProviderControll
+- **BotsController.php** — BotsController.store marks bots 'running' but Dashboard only shows paper/forward/live — new bots never appear as active
+  - Fix: Standardize the bot status vocabulary across BotsController, DashboardController, and the engine. Confirm what value the Rust engine reads to start a bot; align store()/toggle() and activeBots() to the same set.
+- **BotsController.php** — Bot 24h metrics are aggregated by strategy, not by bot — cross-bot metric bleed
+  - Fix: Join metrics on the bot identity (e.g. orders.bot_id / a per-bot strategy instance id) rather than the shared strategy name, or forbid multiple bots per strategy per tenant. Scope win_rate to the same 24h window as the others if that's the 
+- **ExchangeKeyController.php** — Exchange keys and onboarding writes hardcode default tenant instead of the user's tenant
+  - Fix: Replace config('app.default_tenant') with $request->user()->tenant_id in ExchangeKeyController::store (tenant_id and the vault_path) and OnboardingController. Rely on RLS WITH CHECK to enforce it. Add a regression test creating a key as ten
+- **User.php** — role is mass-assignable; registration self-assigns elevated tenant role
+  - Fix: Remove 'role' and 'tenant_id' from $fillable (set them explicitly in trusted code), or guard with $guarded. Never accept role from request input; assign server-side only.
+- **AuthController.php** — stopImpersonating re-authenticates as a session-stored id without verifying it is still an admin
+  - Fix: On stop, reload the impersonator user, verify isAdmin() and active status before loginUsingId, else force logout. Write an audit_log row (via owner connection) for both impersonate start and stop including actor, target tenant, and timestam
+- **BrokerController.php** — rescue() swallows write failures and still flashes success — silent Vault/DB inconsistency and hidden 24x7 failures
+  - Fix: Stop using rescue() around mutations. Let write failures bubble to a logged 500 / flash an error, or at minimum pass a reporting callback to rescue() and return ->with('error',...) when it fires. For safety-critical paths (kill switch, brok
+- **SetTenantContext.php** — Tenant isolation depends entirely on the RLS GUC with no defense-in-depth; fragile to runtime/pooling changes
+  - Fix: Use transaction-scoped GUC: set the local config inside a per-request transaction with the 'true' (is_local) flag, or run DB::statement("SET LOCAL ...") within DB::transaction. Add a defense-in-depth ->where('tenant_id', $request->user()->t
+- **docker-compose.yml** — File cache, file sessions, sync queue, and direct-to-Postgres at 50 concurrent users
+  - Fix: Move SESSION_DRIVER and CACHE_STORE to redis (already present in the stack), set QUEUE_CONNECTION to redis with a worker, and put PgBouncer (session mode, given the GUC dependency) in front of Postgres with a sane pool size. Verify Postgres
+- **Bots.vue** — No client-side error handling on any router mutation — failures are silent under load
+  - Fix: Register a global Inertia handler in app.js (router.on('exception'/'invalid') and an onError default) that surfaces a flash/toast on any failed request, and add onError callbacks to the safety-critical mutations (kill switch, bot toggle/del
+- **06_portfolio_ux.sql** — No 09_demo.sql present, but unconditional demo/seed data ships into production
+  - Fix: Confirm there is no separate demo bundle expected (the file genuinely does not exist). Split true reference data (exchanges, brokers, symbols, help articles) from demo/promotional data and feature flags; gate demo inserts behind an env flag
+- **01_schema.sql** — Hot 50-user query paths lack tenant-scoped indexes (orders, fills, positions, audit_log)
+  - Fix: Add tenant-leading composite indexes: orders (tenant_id, created_at DESC) and (tenant_id, status); fills (tenant_id, filled_at DESC); positions (tenant_id, status); audit_log (tenant_id, at DESC). Keep the existing partial unique on positio
+- **01_schema.sql** — No CHECK constraints on financial/enum domains (side, status, qty, price) — bad rows can reach the trading engine
+  - Fix: Add CHECK constraints: orders.side IN ('buy','sell'), type IN ('market','limit','stop'), status IN (the documented set); fills.side IN ('buy','sell'); positions.side IN ('long','short'), status IN ('open','closed'); plus CHECK (qty > 0) and
+- **ExchangeKeyController.php** — ExchangeKeyController::store ignores the authenticated tenant and hardcodes default_tenant
+  - Fix: Use Auth::user()->tenant_id for both tenant_id and the vault_path in store(), mirroring BrokerController::connect (BrokerController.php:88-89). Once exchange_keys has RLS, the insert's tenant_id must match current_tenant_id() or the WITH CH
+- **.env** — Shipped default credentials on a publicly-bound dashboard
+  - Fix: Before launch: generate a fresh APP_KEY, set strong unique POSTGRES/REDIS/app-role/Grafana/admin passwords (and update DATABASE_URL/REDIS_URL/the algotrader_app role password to match), and put the dashboard behind a reverse proxy / restric
+- **docker-compose.yml** — Vault is in dev mode (in-memory, single root token) - all live secrets lost on restart and over-privileged
+  - Fix: For launch with live capital, run Vault in non-dev mode with a persistent storage backend and auto-unseal, and issue per-service scoped tokens/policies (e.g. dashboard write-only to secret/data/tenants/* and ai/*; engine read-only to its te
+- **lib.rs** — Risk service evaluates every tenant's signals in one sequential task with ~8 serial DB/Redis round-trips
+  - Fix: Process signals concurrently with a bounded worker pool (e.g. spawn a task per message with a tokio::Semaphore cap, or shard by tenant), and collapse the per-signal reads: cache kill_switch/macro/sentiment for a short TTL in-process and fet
+- **router.py** — AI router budget caps and circuit-breaker state are per-uvicorn-worker, not global
+  - Fix: Move spend-today and circuit state to Redis (atomic INCRBYFLOAT with daily expiry for spend; a Redis key/SETEX for circuit-open) so all workers and restarts share it, and have _key_available() honor the DB circuit_open_until column. Alterna
+- **docker-compose.yml** — Production Vault is dev-mode (in-memory, auto-unseal, root token) and default secrets are committed
+  - Fix: Before live: run Vault in production mode with persistent storage + auto-unseal, issue per-service AppRole tokens scoped to only the paths each service needs (engine: secret/exchanges/* and secret/tenants/*; ai-engine: secret/ai/*; dashboar
+- **compliance.rs** — Regulatory PDT and order-rate state is in-memory only — resets on restart (fail-open) and not shared across replicas
+  - Fix: Persist PDT day-trade events (already have positions/fills with closed_at) and reconstruct the rolling 5-day window from the DB on startup, or back the limiter with Redis (atomic INCR + sliding window) keyed per tenant so it is durable and 
+- **lib.rs** — Kill switch enforced only at signal evaluation, not at execution — TOCTOU window lets in-flight orders execute after halt
+  - Fix: Re-check ctx.store.kill_switch() and ctx.store.tenant_halted(order.tenant) at the top of execution::handle() and reject (record as canceled/rejected, publish EXEC_REJECT) if engaged. This makes the kill switch authoritative at the last gate
+- **docker-compose.yml** — Dev-mode Vault used for secrets that gate real broker/AI keys
+  - Fix: For launch keep paper mode, but before live: run Vault in non-dev sealed mode with file/raft storage + auto-unseal, issue scoped AppRole tokens per service (not the root token), and persist KV. Add a Vault check to healthcheck.sh. Document 
+- **.env** — Default/committed credentials and dashboard exposed on 0.0.0.0
+  - Fix: Rotate every secret to strong unique values and source the app-role password from one place (env-substitute it into the SQL or set it via ALTER ROLE post-init). Put a TLS reverse proxy in front, set DASHBOARD_BIND=127.0.0.1, scope TRUSTED_P
+- **docker-compose.yml** — Resource limits + Postgres tuning mis-sized for a 4-core/16GB box
+  - Fix: Set max_connections to a realistic value (e.g. 60-80) and add a PgBouncer or rely on the app pools; size shared_buffers to ~25% RAM only if Postgres gets a dedicated share. Add cpus and memory limits AND reservations to every container so t
+- **docker-compose.yml** — Cold-start dependency gaps: engine waits on infra but not Vault; ai-engine missing redis dep; news/portfolio lack DB-ready waits in code
+  - Fix: Add vault to engine depends_on (and a real Vault readiness healthcheck), add redis to ai-engine depends_on, and add a startup migration/verification step in the dashboard entrypoint (php artisan migrate --force or a schema-version check) in
+- **OnboardingController.php** — OnboardingController::complete writes to the default tenant, not the user's tenant
+  - Fix: Use $request->user()->tenant_id for the tenant_id key (matching how BotsController/AuthController do it) and scope index()/complete() by user_email. Add request validation for 'step' (Rule::in of the known step keys) so arbitrary step strin
+- **ExchangeKeyController.php** — ExchangeKeyController::store hardcodes the default tenant for the key row and Vault path
+  - Fix: Use Auth::user()->tenant_id for both the row and the Vault path, mirroring BrokerController::connect (which does this correctly). Add validation: exchange required+in known list, label nullable string max:60.
+- **router.py** — Per-key daily LLM spend cap is in-memory only — never resets and is lost on restart
+  - Fix: Persist spend in Postgres/Redis keyed by (key_id, UTC date) and compute today's spend with a windowed query (or a Redis counter with a daily-expiring key), reading it in _key_available instead of the in-memory dict. The same applies to mont
+
+## MEDIUM
+
+- **store.rs** — upsert_position close path can close multiple positions and conflates realized_pnl
+  - Fix: Confirm and enforce the one-open-position-per-(tenant,exchange,symbol) invariant (the partial unique index already implies it) and add `AND strategy=$x` if multi-strategy-per-symbol is intended. Make the breaker math explicit: decide whethe
+- **tenant.rs** — Default tenant is a fixed shared UUID with no guard against use in multi-tenant/live mode
+  - Fix: Restrict default_tenant() to paper/synthetic mode (or behind a cfg/test flag), and have order/signal ingestion reject messages lacking an explicit tenant rather than defaulting. Add a check that DEFAULT_TENANT can never be the actor in Live
+- **vault.rs** — Vault creds held as plain String; no zeroization and no in-process TTL/refresh
+  - Fix: Wrap secret fields in a zeroizing type (e.g. the `secrecy`/`zeroize` crate's SecretString) so Drop actually wipes them, and stop claiming zeroization until that's true. Add lease-aware refresh or a bounded TTL so rotated/revoked Vault keys 
+- **binance.rs** — Connect-then-immediate-close resets backoff to 1, enabling a tight reconnect loop / IP ban
+  - Fix: Only reset backoff after the connection has been healthy for some minimum duration (e.g. received N messages or stayed up >30s). Otherwise let backoff continue escalating up to the 30s cap. Add jitter to the sleep.
+- **lib.rs** — Global, unlabeled last-tick gauge masks per-symbol staleness across all tenants
+  - Fix: Emit the gauge with labels: metrics::gauge with exchange+symbol (add a labeled gauge helper in metrics.rs), so Prometheus can alert per-stream. Keep label cardinality bounded to the configured symbol set.
+- **config.rs** — stale_ms config is defined but never enforced in the market-data emit/store path
+  - Fix: Either reduce the Redis TTL toward stale_ms or have readers call price_age_ms and reject ages > stale_ms. Verify the risk-service stale guard referenced in the comment actually exists and is wired to config.stale_ms.
+- **tenant.rs** — Misleading RLS documentation: store::with_tenant does not exist
+  - Fix: Fix the comment to describe the actual model (owner-role bypass + explicit tenant_id), and add a startup assertion that the engine is NOT connected as algotrader_app (or that it has BYPASSRLS), so a misconfigured DATABASE_URL fails fast ins
+- **store.rs** — Postgres pool capped at 10 connections shared by the whole engine — contention at 50 users / multi-symbol
+  - Fix: Make max_connections configurable via env and size it for expected concurrency; set acquire_timeout and test_before_acquire. Separate hot market-data writes from order-path writes if contention is observed.
+- **store.rs** — Postgres pool capped at 10 connections engine-wide — undersized for 50 tenants + live writes
+  - Fix: Raise max_connections to a load-tested value (e.g. 25-50), set acquire_timeout and idle_timeout, and add a per-connection statement_timeout via after_connect. Size against expected concurrency before live launch.
+- **tenant.rs** — Misleading tenant-isolation documentation references a non-existent RLS mechanism in the engine
+  - Fix: Correct the comment to describe the real owner-bypass model and state that the engine is solely responsible for tenant_id binding. Optionally add a thin with_tenant() helper that runs SET LOCAL app.tenant_id on a transaction-scoped connecti
+- **lib.rs** — Per-tenant order-rate cap from the tenants table is ignored; a single global cap is used
+  - Fix: Load each tenant's max_orders_per_sec (cache it, refresh on the gauge loop) and have OrderRateLimiter.allow take a per-tenant limit, or key a separate limiter window per tenant cap. Fall back to default only when unset.
+- **config.rs** — weekly_drawdown_pct is configured but never enforced
+  - Fix: Add a weekly-drawdown gate in evaluate() analogous to the daily one (store needs a realized_pnl_week query and a weekly equity baseline), or remove the field and env var so it can't be mistaken for an active control.
+- **store.rs** — Postgres pool of 10 connections shared across all services may be exhausted under 50-tenant load
+  - Fix: Make pool size configurable (env) and size it for the deployment (e.g. 20-50), set acquire_timeout and idle/max-lifetime, and consider separate pools per service or a dedicated pool for the risk hot path so it can't be starved by analytics 
+- **lib.rs** — Live filled orders record avg_price = 0.0 for market orders
+  - Fix: Extend VenueAck to return filled_qty, avg_fill_price and fee from the venue, and build the Execution from the actual ack, not the order intent. Until then this path should not be reachable (it is currently stubbed to reject), but the data m
+- **lib.rs** — Reference-price fallback can fill at the order's stale price; zero-price guard only catches missing data
+  - Fix: Use store.price_age_ms and reject/flag fills when the reference price is older than config.stale_ms (already plumbed in Config) rather than silently filling at a stale price.
+- **main.rs** — Supervisor does not restart failed service tasks; one dead loop runs degraded indefinitely
+  - Fix: Supervise with restart-with-backoff per service (loop that re-runs run() on return/err), and/or trip the kill-switch + exit the whole process when a critical service (execution/risk) dies so the orchestrator restarts cleanly. Do not treat a
+- **router.py** — Non-ProviderError exceptions bypass recording and circuit breaker
+  - Fix: Defensively parse provider responses (guard empty choices/candidates and raise ProviderError(retryable=False)), and in _call_with_failover record and account for unexpected exceptions instead of silently continuing.
+- **router.py** — consecutive_failures never reset in-memory on success; snapshot replaced on refresh
+  - Fix: Reset cand.key.consecutive_failures = 0 in the success branch of _one_call, and ensure refresh() reconciles in-memory circuit state with the reloaded keys.
+- **router.py** — Read-modify-write budget check is racy across concurrent calls
+  - Fix: Reserve estimated cost at admission time (optimistic debit) and reconcile on completion, or enforce the limit in the store atomically. At minimum, account for in-flight reserved spend in _key_available.
+- **config_store.py** — No RLS / tenant guard at the data layer; single shared DB role
+  - Fix: Adopt RLS on ai_requests/ai_consensus_results/ai_provider_keys with a session GUC set per acquired connection (SET LOCAL app.current_tenant), and make the read/write paths set it inside the transaction. Validate tenant_id is non-null at the
+- **main.py** — tenant_id is unvalidated free-text from the request body
+  - Fix: Validate tenant_id as a UUID (pydantic UUID type) and authenticate/authorize the caller so tenant_id is derived from the trusted caller context rather than accepted from the body. Reject unknown tenants. Ensure this service is only reachabl
+- **router.py** — single() ignores the requested mode and consensus weight uses provider count, not key health
+  - Fix: Make tier resolution explicit (fall back to a designated 'default' tier model, not arbitrary dict order) and surface a warning when a tier is unmapped so cost is predictable.
+- **main.py** — One failing task takes down the entire service (no return_exceptions / supervision)
+  - Fix: Wrap each long-running loop so it self-heals (try/except + backoff inside the while), and use asyncio.gather(*tasks, return_exceptions=True) plus logging of any returned exception, or supervise each task and recreate it on death. Also handl
+- **main.py** — Duplicate Redis connection pool created and leaked in main()
+  - Fix: Drop the standalone client in main.py; expose a small store.set_flag()/store method (or pass store to economic.run and reuse store._redis) so economic uses the existing pooled client. Ensure store also has a close()/aclose() called on shutd
+- **risk_manager.py** — Confidence score flips sign on negligible / low-confidence news
+  - Fix: Gate news_adj behind the same confidence/magnitude thresholds used for the size factor (e.g. only apply when news_confidence >= 50 and abs(aligned) > some_threshold), and scale by abs(aligned) so negligible news has negligible effect. Treat
+- **feature_flags.py** — feature_flags scope matching: empty context value matches wildcard rows, risking cross-tenant flag leakage
+  - Fix: Require a non-empty context value before matching a scope (skip the scope if `want == ''`), and decide explicitly whether '*' is permitted at user/tenant scope or only at 'global'. Use .get() for flag/scope/enabled and skip malformed rows. 
+- **main.py** — Several endpoints accept raw untyped dicts — no validation, weak contracts, 500-prone
+  - Fix: Replace dict/list[dict] params with explicit Pydantic models (StrategyHealthInput, DecisionInput, Candidate, BotPosition, etc.) so invalid input returns 422 with field-level detail instead of 500, and consumers get a stable schema. Wrap rem
+- **BrokerController.php** — Vault and DB writes are not atomic; rescue() swallows the Vault/DB failure and still returns success
+  - Fix: Check the return of the DB write and, on failure, surface an error (and ideally roll back / delete the just-written Vault secret). Don't wrap the post-Vault DB write in a silent rescue().
+- **AiProviderController.php** — AiProviderController liveStatus blocks the page on a synchronous outbound HTTP call to ai-engine
+  - Fix: Cache the provider live-status (short TTL) or fetch it client-side via a separate endpoint so the page render doesn't block on a third service. Keep the timeout but don't make it part of the critical render path.
+- **DashboardController.php** — Universal rescue() wrappers mask DB outages as empty data with HTTP 200
+  - Fix: Stop blanket-swallowing infrastructure errors. Let connection/timeout exceptions surface (so /up health and error-rate alerts fire), and only default-out genuinely optional widgets with an explicit 'data unavailable' flag the UI can show. A
+- **BotsController.php** — BotsController.store has no per-tenant bot/allocation cap and no idempotency — abuse/race at 50 users
+  - Fix: Add a per-tenant bot count / total-allocation cap in validation, add an idempotency guard on store(), and for the strategies.enabled recompute use SELECT ... FOR UPDATE on the strategies row (or an advisory lock keyed on tenant+strategy) so
+- **app.php** — Inertia share middleware runs before tenant context is set
+  - Fix: Order SetTenantContext before HandleInertiaRequests in the append array (or prepend SetTenantContext) so the GUC is set first. Add a comment forbidding tenant-scoped reads in share() unless context is guaranteed.
+- **AppServiceProvider.php** — Owner DB credentials and app-role password default to weak, committed values
+  - Fix: Require these secrets to be provided (fail fast if owner password/Vault token are the dev defaults when APP_ENV!=local). Rotate the algotrader_app role password out of the SQL init file via a templated secret. Confirm pgsql_admin is reachab
+- **AdminController.php** — Admin overview/analytics swallow all DB errors via rescue(), masking outages
+  - Fix: Let rescue log the exception (pass a reporting callback) and surface a clear degraded-state banner instead of fabricated zeros. For mutations (suspendTenant, toggleFlag, impersonate target lookup) do not return a success flash when the unde
+- **AuthController.php** — pgsql_admin (owner, RLS-bypass) connection never has tenant context and is used for cross-tenant reads — ensure it is never reused for tenant-scoped writes
+  - Fix: Document and lint that pgsql_admin is used ONLY for: signup tenant/user creation, and admin cross-tenant analytics. Consider a read-only owner role for the admin dashboard reads to limit write blast radius, and assert in code review that no
+- **AppServiceProvider.php** — pgsql_admin (RLS-bypass owner) connection configured in register() and used for cross-tenant admin reads — verify it is never the default
+  - Fix: Move the connection definition to a config file (config/database.php) rather than register(). Restrict pgsql_admin usage to the Admin namespace and AuthController::register only; add a test/assertion that no tenant-facing controller resolve
+- **AuthController.php** — Mass-assignment surface is limited but register() trusts client-supplied risk_profile/role indirectly; admin impersonation has no audit
+  - Fix: Remove 'role' and 'tenant_id' from User::$fillable (set them explicitly in trusted code only) to harden against future Eloquent create/fill calls. Write an audit_log row on every impersonate start/stop with the admin actor and target tenant
+- **NavIcon.vue** — NavIcon renders icon markup via v-html (XSS sink)
+  - Fix: Keep the icon set strictly client-side (current behavior) and add a guard/comment that P must never be populated from props, or switch to rendering pre-defined <svg> components / a whitelist map returning component refs instead of v-html so
+- **AiProviders.vue** — AI Providers + key management is an admin/platform surface served from the tenant overlay — verify authorization and tenant isolation server-side
+  - Fix: Confirm server-side: every /admin/* and /kill-switch (global) route is behind admin-only middleware; per-tenant resources (bots, broker-connections, exchange-keys, ai-provider keys) are scoped by the authenticated tenant via RLS or query sc
+- **Brokers.vue** — Vault-only secret storage and withdrawal-disabled enforcement are asserted in UI but only checkbox-gated client-side
+  - Fix: Verify in the backend that connect/save handlers write secrets to Vault and never log/persist them, and that withdrawal-disabled is verified by an actual exchange permission check (not the user's self-reported `permissions`/`withdraw_disabl
+- **01_schema.sql** — fills.order_id and positions reference orders but FK lacks index and cascade strategy is undefined
+  - Fix: Either drop the DEFAULT '000...001' on tenant_id for multi-tenant tables so a missing tenant_id errors instead of silently using tenant-zero, or add a trigger/constraint asserting fills.tenant_id = (SELECT tenant_id FROM orders WHERE id = o
+- **01_schema.sql** — Retention/compression policies are asymmetric and could let unbounded time-series tables grow (24x7 resilience)
+  - Fix: Add retention policies (and compression where high-volume) to candles, indicators, ai_requests, ai_failures, social_mentions, onchain_metrics, sentiment_history sized to your data-retention/compliance needs. Confirm a TimescaleDB background
+- **03_multitenancy.sql** — tenants RLS policy makes the tenants table invisible to the app role for cross-tenant admin and signup
+  - Fix: Make the trust boundary explicit: use a dedicated admin/superuser DB role for cross-tenant and signup paths (not the table owner used by the engine), and assert in code which connection each path uses. Consider an additional RLS policy allo
+- **config_store.py** — asyncpg pool max_size=5 is undersized for ~50 concurrent users; pool exhaustion stalls AI engine
+  - Fix: Raise max_size to a value sized to expected concurrency (e.g. 20-30) and set a connection acquire timeout, then load-test at 50 users. Confirm Postgres max_connections accommodates the sum of all service pools.
+- **BrokerController.php** — rescue() silently swallows Vault and DB write failures, risking inconsistent secret state and lost data
+  - Fix: Treat the DB write as part of the operation's success: check its result (or wrap Vault+DB in a try/catch that reports a real error to the user) and log failures. Only show the success message when both the Vault write and the reference inse
+- **store.rs** — Rust engine shares a single PgPool (max 10) across market-data, signals, risk, execution and gauge loops
+  - Fix: Raise max_connections (e.g. 20-30), set min_connections, an acquire_timeout (a few seconds so a stuck query surfaces instead of hanging the hot path), and consider separate pools for the high-write market-data path vs. the read-heavy risk p
+- **BotsController.php** — BotsController.toggle has a strategy enable/disable race and toggles the shared strategies row
+  - Fix: Recompute stillRunning from the post-update state inside a SELECT ... FOR UPDATE (or a single UPDATE ... WHERE EXISTS) so the strategies.enabled write reflects the committed bot states atomically; or model per-bot enablement so one bot's pa
+- **main.py** — FastAPI hot-path /score endpoints are sync defs sharing a 40-thread pool with no separate concurrency budget
+  - Fix: Keep /score/regime/volatility as fast async (they are pure CPU and sub-ms — make them `async def` so they run on the event loop, or raise the threadpool limit) and isolate the LLM /ai/* surface (separate process/port or at least a separate 
+- **SetTenantContext.php** — Per-request RLS GUC set at SESSION scope is fragile under connection reuse
+  - Fix: Set the GUC at transaction scope (set_config(..., true)) inside a per-request DB transaction, or RESET app.tenant_id in a terminating middleware, or set it on every checkout via a connection 'resolved'/beforeExecuting hook. Add a test that 
+- **exchanges.rs** — Live broker credentials are not zeroized despite documented guarantee
+  - Fix: Derive/implement zeroize::ZeroizeOnDrop (or use secrecy::Secret<String>) for ExchangeCreds so api_key/api_secret/passphrase are wiped on drop, and adjust the doc-comments to match reality. Add this to the docs/RISK.md go-live checklist gate
+- **store.rs** — Risk hot path issues ~5 serial DB queries per signal against a 10-connection pool — contention at 50 tenants
+  - Fix: Cache equity_usd / realized_pnl_today / open_position_count in Redis with a short TTL (the news service already publishes to Redis), refreshed by the gauge loop or a writer, so the per-signal path is Redis-only. Make max_connections configu
+- **docker-compose.yml** — Application services have no healthchecks or restart-on-failure readiness gates
+  - Fix: Add healthcheck blocks to each app service hitting their existing /health, /up, or /metrics endpoints, and (optionally) switch downstream depends_on to service_healthy. This also lets orchestration restart hung containers automatically.
+- **docker-compose.yml** — QUEUE_CONNECTION=sync and CACHE/SESSION on file undermine resilience at 50 users
+  - Fix: Move CACHE_STORE and SESSION_DRIVER to redis (already available, password set), and use QUEUE_CONNECTION=redis with a separate queue-worker container so long-running work doesn't block web requests. Add a horizon/worker service to the compo
+- **Dockerfile** — Rust engine image lacks healthcheck and runs all 4 roles in one process (single point of failure)
+  - Fix: Before live capital, split the engine into the 4 deployments described, or at minimum add an engine healthcheck that exercises each subsystem and a watchdog that flattens on engine-unhealthy. Add a metrics/health endpoint distinct from /met
+- **Dockerfile** — Rust build does not cache dependencies; cold builds are very slow and fragile
+  - Fix: Add the standard cargo caching trick: after copying manifests, create dummy src/main.rs/lib.rs stubs, run `cargo build --release` to cache deps, then copy real sources and rebuild. Or use cargo-chef. This makes incremental builds fast and c
+- **06_portfolio_ux.sql** — Postgres init grants are broad and run as superuser, weakening least-privilege
+  - Fix: Replace blanket ON ALL TABLES grants with explicit per-table grants matching intended access (read-only where appropriate), and drop the ALTER DEFAULT PRIVILEGES blanket write grant. Re-grant explicitly when adding tables.
+- **04_ai_providers.sql** — ai_requests / ai_consensus_results are tenant-scoped but have no RLS policy; admin usage view is unscoped
+  - Fix: Add ai_requests and ai_consensus_results to the RLS FOREACH list with the same tenant_isolation policy (the engine owner pool bypasses RLS so writes are unaffected), and scope the admin per-tenant cost view explicitly by tenant when billing
+- **router.py** — AI router rebuilds provider + opens a new httpx client/TLS handshake on every call
+  - Fix: Cache one provider instance (and its httpx.AsyncClient / Anthropic client) per (provider_id, key_id) on the router and reuse it; close/rebuild only when config changes on refresh(). This also lets you bound the connection pool.
+- **router.py** — Race between AIRouter.refresh() replacing self._providers and consensus()/status() iterating it
+  - Fix: Build the new provider list locally in refresh() and assign atomically (already the case), but snapshot self._providers into a local var once at the top of consensus()/status() and iterate that snapshot; or guard refresh()+reads with an asy
+- **DashboardController.php** — rescue() everywhere swallows errors with no logging — real incidents become invisible
+  - Fix: Keep rescue() for read widgets but pass a report callback (rescue($cb, $fallback, report: true) is default) and add structured logging; for write actions, do not blanket-rescue — let failures surface or check the affected-row count and retu
+- **main.py** — Free-form dict request bodies on portfolio endpoints have no schema validation
+  - Fix: Replace the bare `dict` params with Pydantic models (even permissive ones with all-optional fields), or validate isinstance(s, dict) at the top. Add a FastAPI exception handler that returns a structured 400/422 for bad input and 503 for dow
+- **docker-compose.yml** — Hardcoded secrets: app-role DB password and Vault dev token default to change_me/dev values
+  - Fix: Move the app-role password and Vault token to required env with no insecure default (fail fast if unset), generate them per-deploy, and run Vault out of dev mode (the .env comment already notes prod uses unseal keys/auto-unseal). Rotate the
+
+## LOW
+
+- **bus.rs** — Bus publishes are fire-and-forget with no flush/JetStream; control + orders can be lost
+  - Fix: Route safety-critical subjects (control, orders, executions) over JetStream with acks/durable consumers, or at minimum flush() and confirm after publishing control/order messages. Add a metric counter on decode() failures so dropped message
+- **metrics.rs** — metrics::install panics-by-return on second call; per-process exporter assumptions undocumented for split services
+  - Fix: Document and enforce one install per process; ensure each split service gets a distinct ENGINE_METRICS_ADDR. Guard inc_labeled against unbounded label values (tenant/order ids) to avoid Prometheus cardinality blowups across 50 tenants.
+- **binance.rs** — Silent price/qty parse fallback to 0.0 can corrupt candle volume and skew ticks
+  - Fix: On qty parse failure, log+count a malformed-message metric and skip the tick rather than emitting qty=0. Treat unparseable price/qty as a discarded message, not a zero.
+- **synthetic.rs** — Synthetic source hardcodes exchange='paper' while Binance uses 'binance' — candle keyspace divergence and seed-price gaps
+  - Fix: Document that synthetic and exchange are non-interchangeable keyspaces (or make the synthetic exchange label configurable to match), and log a warning when seed_price hits the default branch so unrecognised symbols are visible.
+- **ai.rs** — AI scoring uses a throwaway reqwest::Client and a 50ms timeout with no connection reuse safeguards
+  - Fix: Raise the timeout to a realistic value (e.g. 200-500ms) or make it configurable, and add a metrics counter (e.g. ai_score_failures_total) so silent AI degradation is observable. Confirm whether ai_score being null downstream changes any siz
+- **lib.rs** — load_profiles failure fallback silently trades a hardcoded default tenant strategy
+  - Fix: On DB error at startup, fail fast (return Err) or start idle with a loud error/alert rather than fabricating a default trading strategy. Reserve the DEFAULT_TENANT fallback for the explicitly self-contained synthetic stack only (gate on con
+- **lib.rs** — spawn_gauge_loop reports open_positions only for the default tenant
+  - Fix: Either aggregate open positions across all tenants (SELECT count(*) FROM positions WHERE status='open') for a fleet gauge, or emit a per-tenant labeled gauge. Drop the default-tenant-only count.
+- **lib.rs** — base_asset suffix stripping can misclassify symbols and mis-route the sentiment veto
+  - Fix: Key sentiment by the canonical base asset carried on the Signal (add a base_asset/asset field populated by the signals service) rather than re-deriving it via string suffix heuristics in the risk gate; or restrict the heuristic to crypto ex
+- **lib.rs** — Order publish/persist is fire-and-forget with no ack to the bus; failures only logged
+  - Fix: Move the orders subject to JetStream with explicit ack so failed handling redelivers (paired with the fill idempotency fix above), and increment an orders_errored_total metric in the error branch so the silent-loss condition is alertable.
+- **config_store.py** — Pool max_size=5 likely too small for 50 concurrent users
+  - Fix: Size the pool from config/env based on expected concurrency (e.g. 20-30) and load-test; expose it as an env var.
+- **openai_provider.py** — OpenAI/DeepSeek use deprecated max_tokens param
+  - Fix: Send max_completion_tokens for OpenAI-family models (or branch by model), and drop 529 from the OpenAI retryable set.
+- **main.py** — FastAPI on_event('startup') is deprecated and startup failure leaves router None silently
+  - Fix: Switch to the lifespan API and add a background task that retries _store.connect()/_router.refresh() with backoff until it succeeds, so the engine self-heals after a transient DB outage.
+- **analyzer.py** — AI fail-open hides sustained outages — every article silently records neutral/unavailable sentiment
+  - Fix: Add a Prometheus counter for ai_unavailable (increment when label=='unavailable' or status!=200) and alert on its rate, so an AI outage is observable even though the pipeline keeps running.
+- **collector.py** — Synthetic dedup bucket comment is wrong (re-emits every ~7 min, not hourly) and unbounded url growth
+  - Fix: Either pace synthetic re-emission to truly hourly (gate by wall-clock hour) or stop re-emitting duplicates entirely; ensure paper-mode synthetic data has a retention/cleanup so it does not grow the hypertables indefinitely before launch.
+- **store.py** — DB pool sized at 8 connections is shared across collector + economic + N workers + hot rollup query
+  - Fix: Confirm pool sizing >= concurrent acquisitions (roughly WORKERS plus collector/economic) and add a composite index supporting the recent_asset_sentiment ordering (assets GIN already exists; consider an index on (created_at DESC) already pre
+- **optimizer.py** — Random optimizer is fully deterministic with a hardcoded seed=1 (no per-request variation)
+  - Fix: Either seed the LCG from the request (e.g. hash of space + an optional client seed) so random search actually explores, or document clearly in the API response that method is a deterministic placeholder. Ensure the UI/marketing does not cla
+- **profiles.py** — Risk-profile resolve silently falls back to 'balanced' on unknown profile name
+  - Fix: If name not in PRESETS and no overrides, either reject (422) or include an explicit warning field (e.g. 'unknown_profile_defaulted_to_balanced') in the risk_size response so the discrepancy is visible to the caller and the dashboard.
+- **KillSwitchController.php** — KillSwitch and toggle paths swallow Redis/DB failures, so an emergency halt can silently no-op
+  - Fix: For the kill switch specifically, do not swallow the Redis failure — if the write fails, return an explicit error so the operator knows the halt did NOT take effect, and surface/alert on it. Audit_log can stay best-effort.
+- **HelpController.php** — Help search uses ilike with %q% (unindexable) and no length cap on q
+  - Fix: Validate q (max length), and for real search use a Postgres full-text (tsvector/GIN) index or trigram (pg_trgm GIN) instead of leading-wildcard ILIKE.
+- **AuthController.php** — Login has no rate limiting / throttle middleware
+  - Fix: Add ->middleware('throttle:6,1') (or a named login limiter) to the POST /login route, and consider the same for /register.
+- **HandleInertiaRequests.php** — tradingMode/region read from env() at request time while config is cleared (not cached)
+  - Fix: Read these from config() values backed by a config file (e.g. config('app.trading_mode')) rather than env() at runtime, so config caching is safe. Important before flipping to live capital, where mislabeling paper/live is high-stakes.
+- **Bots.vue** — Bots search filter assumes b.pair/b.strategy are always present and uses inconsistent field names
+  - Fix: Guard concatenation: `[b.name,b.pair,b.strategy].filter(Boolean).join(' ').toLowerCase()`. Reconcile the symbol/pair/coin field names with the actual API payload so created bots render correctly without a reload.
+- **ExecutionLogs.vue** — List rows keyed by array index in several tables/lists
+  - Fix: Key by a stable identifier where one exists (l.log_id for logs, a.target_id for allocations, etc.) instead of the loop index, especially for the live-refreshing ExecutionLogs table.
+- **Brokers.vue** — initials()/monoColor() assume non-null string inputs and can throw on empty props
+  - Fix: Default the argument: `initials(name='?')` and guard `monoColor(id='')`, mirroring AppLayout's defensive pattern, so partial connection data degrades to a monogram instead of throwing.
+- **06_portfolio_ux.sql** — no_withdraw_keys CHECK is good but withdraw_enabled/safe defaults and float money fields are inconsistent across security tables
+  - Fix: Keep the no_withdraw constraint. Standardize all monetary columns on NUMERIC (price_usd, amount_usd, equity_usd, max_drawdown_stop). Optionally add a CHECK or trigger preventing a key with safe=false from being referenced by an active live 
+- **d.txt** — Session/CSRF cookie token files committed to the working tree
+  - Fix: Delete d.txt and l.txt and add a gitignore rule for stray cookie/debug files. Rotate APP_KEY at launch (already recommended) so any leaked session tokens become undecryptable.
+- **config_store.py** — ConfigStore.resolve_secret uses Vault KV path with no caching and a fresh httpx client per call
+  - Fix: Cache resolved secrets in-process with a short TTL keyed by secret_ref, reuse a single httpx.AsyncClient, and treat Vault 5xx/timeouts as retryable rather than permanent skips.
+- **ExchangeKeyController.php** — ExchangeKeyController.store/index do not scope by tenant in app code and store() claims to write Vault but does not
+  - Fix: Use $request->user()->tenant_id for the insert (not the default tenant), and either actually PUT the secret to Vault here (as AiProviderController.addKey does) or change the user-facing message so operators aren't told a secret was persiste
+- **DashboardController.php** — Broad rescue() with fixed fallbacks hides DB/RLS failures as empty data
+  - Fix: Narrow rescue() to expected/optional lookups only, log the caught exception (report()), and let infrastructure failures surface (or render an explicit 'data temporarily unavailable' state) instead of indistinguishable empty/zero values.
+- **binance.rs** — Synthetic price parse failures silently produce zero and skip; market-data handler errors only warn
+  - Fix: Emit a distinct metric/counter for tick parse failures and a per-symbol 'last good tick' gauge so a broken feed is alertable directly rather than only surfacing as generic staleness.
+- **backup.sh** — Vault dev-mode binds 0.0.0.0 internally and uses HTTP only; backup script lacks off-box copy/encryption
+  - Fix: Encrypt dumps (age/gpg) and ship off-box (S3/rsync) with retention there; for live, add WAL archiving as the README notes. Keep Vault on TLS in prod. These are lower priority for a paper launch but should be tracked.
+- **BrokerController.php** — Vault credential write is not rolled back if the Postgres reference insert fails
+  - Fix: Check the result of the DB upsert (don't swallow it); on failure, delete the just-written Vault secret and return an error. Or write the DB reference first within a transaction and write Vault last, treating a Vault failure as the rollback 
+- **router.py** — circuit breaker DB update is fire-and-forget via asyncio.create_task with no error handling
+  - Fix: Either await the trip in the failure path, or wrap the create_task target in a function that catches/logs and add a done-callback that logs exceptions; reconcile circuit state from the DB on refresh().

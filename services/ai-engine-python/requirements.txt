@@ -1,0 +1,13 @@
+# Lightweight runtime — keeps the image small enough for a single VPS.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+numpy==2.2.1
+pandas==2.2.3
+pydantic==2.10.4
+prometheus-client==0.21.1
+nats-py==2.9.0
+scikit-learn==1.6.0
+# Multi-AI provider layer
+anthropic==0.40.0          # official Anthropic SDK (Claude provider)
+httpx==0.28.1              # OpenAI + Gemini providers (REST)
+asyncpg==0.30.0            # provider/key config + usage logging

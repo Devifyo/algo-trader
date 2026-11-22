@@ -1,0 +1,334 @@
+# algo-trader — full stack. Bring up in stages with the Makefile targets.
+# All host ports bind to 127.0.0.1; expose via reverse proxy / k8s ingress.
+name: algotrader
+
+x-logging: &default-logging
+  driver: "json-file"
+  options: { max-size: "10m", max-file: "3" }
+
+x-restart: &restart unless-stopped
+
+networks:
+  algonet:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  natsdata:
+  promdata:
+  grafanadata:
+  lokidata:
+  vaultdata:
+
+services:
+  # ───────────────────────── Data plane ─────────────────────────
+  postgres:
+    image: timescale/timescaledb:2.17.2-pg16
+    restart: *restart
+    logging: *default-logging
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-algotrader}
+      POSTGRES_USER: ${POSTGRES_USER:-algotrader}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-algotrader}
+      TZ: ${TZ:-UTC}
+    command: >
+      postgres -c shared_preload_libraries=timescaledb
+               -c max_connections=200
+               -c shared_buffers=512MB
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports: ["127.0.0.1:${POSTGRES_PORT:-8131}:5432"]
+    networks: [algonet]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-algotrader} -d ${POSTGRES_DB:-algotrader}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7.4-alpine
+    restart: *restart
+    logging: *default-logging
+    command: >
+      redis-server --appendonly yes
+                   --requirepass ${REDIS_PASSWORD:-algotrader}
+                   --maxmemory 1gb --maxmemory-policy allkeys-lru
+    volumes:
+      - redisdata:/data
+    ports: ["127.0.0.1:${REDIS_PORT:-8132}:6379"]
+    networks: [algonet]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-algotrader}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  nats:
+    image: nats:2.10-alpine
+    restart: *restart
+    logging: *default-logging
+    command: >
+      -js -sd /data -m 8222
+    volumes:
+      - natsdata:/data
+    ports:
+      - "127.0.0.1:${NATS_CLIENT_PORT:-8133}:4222"
+      - "127.0.0.1:${NATS_MONITOR_PORT:-8134}:8222"
+    networks: [algonet]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  vault:
+    image: hashicorp/vault:1.18
+    restart: *restart
+    logging: *default-logging
+    cap_add: [IPC_LOCK]
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_ROOT_TOKEN:-dev-only-root-token}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      VAULT_ADDR: http://0.0.0.0:8200
+    command: server -dev
+    volumes:
+      - vaultdata:/vault/file
+    ports: ["127.0.0.1:${VAULT_PORT:-8138}:8200"]
+    networks: [algonet]
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ───────────────────────── Trading core ─────────────────────────
+  # Single-process supervisor binary (engine) runs market-data+signals+risk+
+  # execution for dev/small deployments. In k8s these split into 4 deployments.
+  trading-engine:
+    build:
+      context: ../../services/trading-engine-rust
+      dockerfile: Dockerfile
+    restart: *restart
+    logging: *default-logging
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      REGION: ${REGION:-us-east-1}
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,ADAUSDT,DOTUSDT,LTCUSDT,ATOMUSDT}
+      # Market data: synthetic (random walk) | exchange (REAL Binance feed).
+      MARKET_DATA_SOURCE: ${MARKET_DATA_SOURCE:-synthetic}
+      # false = REAL Binance market-data stream (data only — execution stays Alpaca).
+      BINANCE_TESTNET: ${BINANCE_TESTNET:-true}
+      # Candle bucket seconds. 3s in synthetic/paper mode so strategies + scanner
+      # warm up in minutes; set to 60 for real-market (exchange) data.
+      CANDLE_SECONDS: ${CANDLE_SECONDS:-60}
+      # Max price age before a signal is rejected as STALE_PRICE. Must comfortably
+      # exceed the gap between ticks for low-liquidity alts (ATOM/ADA tick ~10–20s)
+      # — 5s was far too tight for 1m-candle trading and blocked valid buys.
+      STALE_MS: ${STALE_MS:-60000}
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      VAULT_ADDR: ${VAULT_ADDR:-http://vault:8200}
+      VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN:-dev-only-root-token}
+      AI_ENGINE_URL: http://ai-engine:8000
+      RISK_MAX_PER_TRADE_PCT: ${RISK_MAX_PER_TRADE_PCT:-0.5}
+      RISK_DAILY_DRAWDOWN_PCT: ${RISK_DAILY_DRAWDOWN_PCT:-3.0}
+      RISK_WEEKLY_DRAWDOWN_PCT: ${RISK_WEEKLY_DRAWDOWN_PCT:-8.0}
+      RISK_MAX_LEVERAGE: ${RISK_MAX_LEVERAGE:-5}
+      RISK_MAX_OPEN_POSITIONS: ${RISK_MAX_OPEN_POSITIONS:-10}
+      KILL_SWITCH: ${KILL_SWITCH:-off}
+      ENGINE_METRICS_ADDR: 0.0.0.0:9100
+    command: ["engine"]
+    ports: ["127.0.0.1:${ENGINE_METRICS_PORT:-8139}:9100"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      nats:     { condition: service_healthy }
+    networks: [algonet]
+    deploy:
+      resources:
+        limits: { memory: 512m }
+
+  ai-engine:
+    build:
+      context: ../../services/ai-engine-python
+      dockerfile: Dockerfile
+    restart: *restart
+    logging: *default-logging
+    environment:
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      VAULT_ADDR: ${VAULT_ADDR:-http://vault:8200}
+      VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN:-dev-only-root-token}
+      AI_LB_MODE: ${AI_LB_MODE:-priority}
+      # Provider key secrets (referenced by ai_provider_keys.secret_ref).
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    ports: ["127.0.0.1:${AI_ENGINE_PORT:-8140}:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      nats: { condition: service_healthy }
+    networks: [algonet]
+    deploy:
+      resources:
+        limits: { memory: 1g }
+
+  # NautilusTrader backtest/validation engine — BACKTEST ONLY (no live orders,
+  # no broker keys, not wired to execution). Validates strategies on a
+  # professional engine before anything touches customer money.
+  nautilus-backtest:
+    build:
+      context: ../../services/nautilus-backtest
+      dockerfile: Dockerfile
+    restart: *restart
+    logging: *default-logging
+    ports: ["127.0.0.1:${NAUTILUS_BACKTEST_PORT:-8143}:8000"]
+    networks: [algonet]
+    deploy:
+      resources:
+        limits: { memory: 1g }
+
+  news-service:
+    build:
+      context: ../../services/news-service
+      dockerfile: Dockerfile
+    restart: *restart
+    logging: *default-logging
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      AI_ENGINE_URL: http://ai-engine:8000
+      NEWS_SOURCE: ${NEWS_SOURCE:-synthetic}
+      NEWS_WORKERS: ${NEWS_WORKERS:-3}
+    ports: ["127.0.0.1:${NEWS_PORT:-8141}:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      nats: { condition: service_healthy }
+    networks: [algonet]
+    deploy:
+      resources:
+        limits: { memory: 512m }
+
+  portfolio-service:
+    build:
+      context: ../../services/portfolio-service
+      dockerfile: Dockerfile
+    restart: *restart
+    logging: *default-logging
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      AI_ENGINE_URL: http://ai-engine:8000
+    ports: ["127.0.0.1:${PORTFOLIO_PORT:-8142}:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [algonet]
+    deploy:
+      resources:
+        limits: { memory: 512m }
+
+  # ───────────────────────── Management ─────────────────────────
+  dashboard:
+    build:
+      context: ../../dashboard/laravel
+      dockerfile: Dockerfile
+    restart: *restart
+    logging: *default-logging
+    environment:
+      APP_NAME: ${APP_NAME:-tradepilot}
+      APP_ENV: ${APP_ENV:-local}
+      APP_KEY: ${APP_KEY}
+      APP_URL: ${APP_URL:-https://tradepilot.devifyo.cloud}
+      APP_DEBUG: "false"
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      REGION: ${REGION:-us-east-1}
+      DEFAULT_TENANT: "00000000-0000-0000-0000-000000000001"
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: ${POSTGRES_DB:-algotrader}
+      # Connect as the RLS-restricted app role (NOT the engine owner) so tenant
+      # isolation is enforced at the database layer for everything the hub reads.
+      DB_USERNAME: algotrader_app
+      DB_PASSWORD: change_me_app_role
+      # Owner role for the admin area + signup (cross-tenant, RLS bypass).
+      DB_OWNER_USERNAME: ${POSTGRES_USER:-algotrader}
+      DB_OWNER_PASSWORD: ${POSTGRES_PASSWORD:-algotrader}
+      # Platform admin bootstrap (created on first boot).
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin12345!}
+      CACHE_STORE: file
+      QUEUE_CONNECTION: sync
+      REDIS_CLIENT: predis
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-algotrader}
+      AI_ENGINE_URL: http://ai-engine:8000
+      PORTFOLIO_URL: http://portfolio-service:8000
+      # Strategy report counts only real-data-era trades (excludes synthetic history).
+      STRATEGY_STATS_SINCE: ${STRATEGY_STATS_SINCE:-}
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      # Vault — the dashboard writes AI keys here (never to Postgres).
+      VAULT_ADDR: ${VAULT_ADDR:-http://vault:8200}
+      VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN:-dev-only-root-token}
+      SESSION_DRIVER: file
+      TRUSTED_PROXIES: "*"
+    # Public: reachable at http://<server-ip>:8130 now; put a reverse proxy +
+    # domain in front later (then switch this back to 127.0.0.1 and proxy to it).
+    ports: ["${DASHBOARD_BIND:-0.0.0.0}:${DASHBOARD_PORT:-8130}:80"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      vault:    { condition: service_started }
+    networks: [algonet]
+    deploy:
+      resources:
+        limits: { memory: 512m }
+
+  # ───────────────────────── Observability ─────────────────────────
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    restart: *restart
+    logging: *default-logging
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-lifecycle
+    volumes:
+      - ../monitoring/prometheus:/etc/prometheus:ro
+      - promdata:/prometheus
+    ports: ["127.0.0.1:${PROMETHEUS_PORT:-8135}:9090"]
+    networks: [algonet]
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    restart: *restart
+    logging: *default-logging
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports: ["127.0.0.1:${GRAFANA_PORT:-8136}:3000"]
+    depends_on: [prometheus, loki]
+    networks: [algonet]
+
+  loki:
+    image: grafana/loki:3.3.2
+    restart: *restart
+    logging: *default-logging
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ../monitoring/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - lokidata:/loki
+    ports: ["127.0.0.1:${LOKI_PORT:-8137}:3100"]
+    networks: [algonet]

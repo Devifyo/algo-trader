@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/market-data",
+    "crates/signals",
+    "crates/risk",
+    "crates/execution",
+    "crates/engine",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "proprietary"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+async-nats = "0.38"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+redis = { version = "0.27", features = ["tokio-comp"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "uuid"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+futures = "0.3"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", features = ["http-listener"] }
+rand = "0.8"
+
+# Thin release profile tuned for latency-sensitive binaries.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
